@@ -1,0 +1,812 @@
+#!/usr/bin/env zsh
+
+# clockify-clean: Remove unsaved autotracker entries not related to job
+# Usage: clockify-clean [options]
+# 
+# This script helps clean up Clockify time entries by:
+# 1. Listing all time entries from a specified date range
+# 2. Filtering out entries that are likely work-related
+# 3. Showing non-work entries for review and deletion
+#
+# Options:
+#   -d, --days <num>     Number of days back to check (default: 7)
+#   -p, --project <name> Work project name pattern to keep (regex supported)
+#   -t, --tag <name>     Work tag name pattern to keep (regex supported)
+#   --dry-run            Show what would be deleted without actually deleting
+#   --batch              Show all entries first, then confirm deletion
+#   -y, --yes            Skip confirmation prompts (dangerous!)
+#   -h, --help           Show this help message
+
+set -euo pipefail
+
+# Delimiter for internal array storage (ASCII 31 - Unit Separator)
+readonly DELIM=$'\x1F'
+
+# Default configuration
+DAYS_BACK=7
+WORK_PROJECTS=()
+WORK_TAGS=()
+DRY_RUN=false
+BATCH_MODE=false
+SKIP_CONFIRMATION=false
+VERBOSE=false
+
+# App filtering configuration
+WHITELIST_APPS=("Cursor" "Figma" "Microsoft Teams" "Teams" "Tor Browser" "Docker Desktop")
+BLACKLIST_APPS=("loginwindow" "Spotify" "Netflix" "Mail" "Clockify Desktop" "Warp" "Messages" "Preview" "System Settings" "FL Studio" "iPhone Mirroring" "Finder")
+
+# Domain filtering configuration (for browsers and apps with URLs)
+WHITELIST_DOMAINS=("github.com" "localhost" "vercel.com" "127.0.0.1" "convex.dev" "lucide.dev" "console.cloud.google.com" "mozilla.org" "heroicons.com")
+BLACKLIST_DOMAINS=("x.com" "linkedin.com" "coinmarketcap.com" "tradingview.com" "bybitglobal.com" "bybit.com" "music.youtube.com" "youtube.com" "mantle.xyz" "reuters.com" "claude.ai" "newtab" "aniwatchtv.to" "openai.com"  "linkedin.com" "jumia.com" "reddit.com" "instagram.com" "192.168.0.1" "chatgpt.com" "coinbase.com")
+
+# Color codes for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Usage function
+usage() {
+    echo "clockify-clean: Remove unsaved autotracker entries not related to job"
+    echo ""
+    echo "Usage: clockify-clean [options]"
+    echo ""
+    echo "Options:"
+    echo "  -d, --days <num>     Number of days back to check (default: 7)"
+    echo "  --dry-run            Show what would be deleted without actually deleting"
+    echo "  --batch              Show all entries first, then confirm batch deletion"
+    echo "  -y, --yes            Skip confirmation prompts (dangerous!)"
+    echo "  -v, --verbose        Show verbose output"
+    echo "  -h, --help           Show this help message"
+    echo ""
+    echo "App Filters (hardcoded):"
+    echo "  Whitelist (always keep): Cursor, Figma, Teams"
+    echo "  Blacklist (always delete): loginwindow, Spotify, Netflix, Mail, Clockify Desktop"
+    echo ""
+    echo "Domain Filters (hardcoded):"
+    echo "  Whitelist (always keep): github.com, localhost"
+    echo "  Blacklist (always delete): x.com, linkedin.com, coinmarketcap.com, tradingview.com,"
+    echo "                             bybitglobal.com, bybit.com, youtube.com, music.youtube.com,"
+    echo "                             mantle.xyz, reuters.com"
+    echo "  Other domains: Will prompt for review"
+    echo ""
+    echo "Examples:"
+    echo "  clockify-clean -d 7 --dry-run    # Preview what would be deleted"
+    echo "  clockify-clean --batch           # Batch mode with one confirmation"
+    echo "  clockify-clean -d 30 -y          # Delete last 30 days without prompts"
+}
+
+# Logging functions
+log_info() {
+    echo -e "${BLUE}[INFO]${NC} $1" >&2
+}
+
+log_warn() {
+    echo -e "${YELLOW}[WARN]${NC} $1" >&2
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $1" >&2
+}
+
+log_success() {
+    echo -e "${GREEN}[SUCCESS]${NC} $1" >&2
+}
+
+# Check if required tools are available
+check_dependencies() {
+    if ! command -v sqlite3 &> /dev/null; then
+        log_error "sqlite3 is not installed or not in PATH"
+        log_error "This script requires sqlite3 to read the Clockify database"
+        exit 1
+    fi
+    
+    if ! command -v jq &> /dev/null; then
+        log_warn "jq is not installed - some features may not work"
+    fi
+}
+
+# Parse command line arguments
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -d|--days)
+                DAYS_BACK="$2"
+                if [[ ! "$DAYS_BACK" =~ ^[0-9]+$ ]]; then
+                    log_error "Days must be a positive number"
+                    exit 1
+                fi
+                shift 2
+                ;;
+            --dry-run)
+                DRY_RUN=true
+                shift
+                ;;
+            --batch)
+                BATCH_MODE=true
+                shift
+                ;;
+            -y|--yes)
+                SKIP_CONFIRMATION=true
+                shift
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                log_error "Unknown option: $1"
+                usage
+                exit 1
+                ;;
+        esac
+    done
+}
+
+# Get start date based on days back
+get_start_date() {
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        # macOS date command
+        date -v-${DAYS_BACK}d '+%Y-%m-%d'
+    else
+        # GNU date command (Linux)
+        date -d "$DAYS_BACK days ago" '+%Y-%m-%d'
+    fi
+}
+
+# Get the Clockify database path
+get_clockify_db() {
+    local clockify_dir="$HOME/Library/Application Support/Clockify Desktop"
+    
+    # Try to find workspace-specific database
+    local db_path=$(find "$clockify_dir" -maxdepth 1 -name "Clockify_*.sqlite" -type f 2>/dev/null | head -1)
+    
+    if [[ -z "$db_path" ]]; then
+        # Fallback to main database
+        db_path="$clockify_dir/Clockify.sqlite"
+    fi
+    
+    if [[ ! -f "$db_path" ]]; then
+        log_error "Clockify database not found in: $clockify_dir"
+        log_error "Make sure Clockify Desktop app is installed and has synced"
+        exit 1
+    fi
+    
+    echo "$db_path"
+}
+
+# Check if an app is whitelisted (should be kept)
+is_whitelisted_app() {
+    local app_name="$1"
+    for whitelist_app in "${WHITELIST_APPS[@]}"; do
+        if [[ "$app_name" == "$whitelist_app" ]]; then
+            return 0  # Keep this entry
+        fi
+    done
+    return 1  # Not whitelisted
+}
+
+# Check if an app is blacklisted (should be deleted)
+is_blacklisted_app() {
+    local app_name="$1"
+    for blacklist_app in "${BLACKLIST_APPS[@]}"; do
+        if [[ "$app_name" == "$blacklist_app" ]]; then
+            return 0  # Delete this entry
+        fi
+    done
+    return 1  # Not blacklisted
+}
+
+# Check if a URL domain is whitelisted (should be kept)
+is_whitelisted_domain() {
+    local url="$1"
+    
+    if [[ -z "$url" ]]; then
+        return 1  # No URL, not whitelisted
+    fi
+    
+    # Normalize URL (remove www. for comparison)
+    local normalized_url=$(echo "$url" | sed -E 's|://www\.|://|')
+    
+    for domain in "${WHITELIST_DOMAINS[@]}"; do
+        # Escape dots for regex matching and normalize domain pattern
+        local normalized_domain=$(echo "$domain" | sed -E 's|^www\.||' | sed 's/\./\\./g')
+        if [[ "$normalized_url" =~ $normalized_domain ]]; then
+            return 0  # Whitelisted domain
+        fi
+    done
+    return 1  # Not whitelisted
+}
+
+# Check if a URL domain is blacklisted (should be deleted)
+is_blacklisted_domain() {
+    local url="$1"
+    
+    if [[ -z "$url" ]]; then
+        return 1  # No URL, not blacklisted
+    fi
+    
+    # Normalize URL (remove www. for comparison)
+    local normalized_url=$(echo "$url" | sed -E 's|://www\.|://|')
+    
+    for domain in "${BLACKLIST_DOMAINS[@]}"; do
+        # Escape dots for regex matching and normalize domain pattern  
+        local normalized_domain=$(echo "$domain" | sed -E 's|^www\.||' | sed 's/\./\\./g')
+        if [[ "$normalized_url" =~ $normalized_domain ]]; then
+            return 0  # Blacklisted domain
+        fi
+    done
+    return 1  # Not blacklisted
+}
+
+# Determine if an autotracker entry should be kept or deleted
+should_keep_entry() {
+    local app_name="$1"
+    local url="$2"
+    local description="$3"
+    
+    # Check domain whitelist first (highest priority - always keep)
+    if is_whitelisted_domain "$url"; then
+        if [[ "$VERBOSE" == "true" ]]; then
+            log_info "Keeping whitelisted domain: $url"
+        fi
+        return 0  # Keep
+    fi
+    
+    # Check domain blacklist (high priority - always delete)
+    if is_blacklisted_domain "$url"; then
+        if [[ "$VERBOSE" == "true" ]]; then
+            log_info "Deleting blacklisted domain: $url"
+        fi
+        return 1  # Delete
+    fi
+    
+    # Check app whitelist (always keep)
+    if is_whitelisted_app "$app_name"; then
+        if [[ "$VERBOSE" == "true" ]]; then
+            log_info "Keeping whitelisted app: $app_name"
+        fi
+        return 0  # Keep
+    fi
+    
+    # Check app blacklist (always delete)
+    if is_blacklisted_app "$app_name"; then
+        if [[ "$VERBOSE" == "true" ]]; then
+            log_info "Deleting blacklisted app: $app_name"
+        fi
+        return 1  # Delete
+    fi
+    
+    # For other apps not in whitelist or blacklist, prompt user (return 2 for "undecided")
+    return 2  # Undecided - will prompt user
+}
+
+# Extract domain from URL
+extract_domain() {
+    local url="$1"
+    if [[ -z "$url" ]]; then
+        echo ""
+        return
+    fi
+    # Extract domain from URL (remove protocol and path)
+    echo "$url" | sed -E 's|^[a-z]+://||' | sed -E 's|/.*||' | sed -E 's|:.*||'
+}
+
+# Get autotracker entries and identify non-work entries
+get_entries_to_delete() {
+    local start_date=$(get_start_date)
+    local db_path=$(get_clockify_db)
+    local entries_to_delete=()
+    local entries_undecided=()
+    
+    # Associative arrays to track domain decisions (simulated with string matching)
+    declare -A domain_decisions  # Will store: domain -> 0(keep) or 1(delete)
+    
+    log_info "Fetching unsaved autotracker entries from $start_date to today..."
+    log_info "Database: $db_path"
+    
+    # Calculate timestamp cutoff (Core Data uses reference date of 2001-01-01)
+    # We need to convert our date to seconds since 2001-01-01
+    local cutoff_timestamp
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        cutoff_timestamp=$(date -j -f "%Y-%m-%d" "$start_date" "+%s")
+        # Subtract Core Data epoch (2001-01-01 00:00:00 UTC = 978307200)
+        cutoff_timestamp=$((cutoff_timestamp - 978307200))
+    else
+        cutoff_timestamp=$(date -d "$start_date" "+%s")
+        cutoff_timestamp=$((cutoff_timestamp - 978307200))
+    fi
+    
+    # Query unsaved autotracker items
+    local query="SELECT ZID, ZNAME, ZITEMDESCRIPTION, ZITEMURL, 
+                 datetime(ZTIMESTARTED + 978307200, 'unixepoch') as start_time,
+                 datetime(ZTIMEENDED + 978307200, 'unixepoch') as end_time,
+                 ZTIMESTARTED, ZTIMEENDED
+                 FROM ZCDAUTOTRACKERITEM 
+                 WHERE ZTIMEENTRYADDED = 0 
+                 AND ZTIMESTARTED >= $cutoff_timestamp
+                 ORDER BY ZTIMESTARTED DESC"
+    
+    local temp_file=$(mktemp)
+    if ! sqlite3 -separator $'\x1F' "$db_path" "$query" > "$temp_file" 2>/dev/null; then
+        log_error "Failed to query Clockify database"
+        rm -f "$temp_file"
+        exit 1
+    fi
+    
+    local entry_count=$(wc -l < "$temp_file" | tr -d ' ')
+    
+    if [[ "$entry_count" == "0" ]]; then
+        log_info "No unsaved autotracker entries found in the specified date range"
+        rm -f "$temp_file"
+        return 0
+    fi
+    
+    log_info "Found $entry_count unsaved autotracker entries to analyze"
+    
+    # Parse database results (SQLite outputs with ASCII 31 delimiter to handle | in descriptions)
+    while IFS=$'\x1F' read -r id app_name description url start_time end_time ts_start ts_end; do
+        if [[ "$VERBOSE" == "true" ]]; then
+            log_info "Analyzing: $app_name - $description"
+        fi
+        
+        # Skip if missing end time (still running)
+        if [[ -z "$end_time" || "$end_time" == "" ]]; then
+            if [[ "$VERBOSE" == "true" ]]; then
+                log_info "Skipping running entry: $id"
+            fi
+            continue
+        fi
+        
+        # Check if entry should be kept or deleted
+        local decision=0
+        should_keep_entry "$app_name" "$url" "$description" && decision=0 || decision=$?
+        
+        # Use DELIM to avoid conflicts with | in descriptions
+        if [[ $decision -eq 1 ]]; then
+            # Should delete
+            entries_to_delete+=("$id$DELIM$app_name$DELIM$description$DELIM$url$DELIM$start_time$DELIM$end_time")
+        elif [[ $decision -eq 2 ]]; then
+            # Undecided - check if we have a domain decision
+            local domain=$(extract_domain "$url")
+            
+            if [[ -n "$domain" ]] && [[ -n "${domain_decisions[$domain]+isset}" ]]; then
+                # We already have a decision for this domain
+                if [[ "${domain_decisions[$domain]}" == "1" ]]; then
+                    entries_to_delete+=("$id$DELIM$app_name$DELIM$description$DELIM$url$DELIM$start_time$DELIM$end_time")
+                fi
+                # If decision was 0 (keep), we do nothing
+            else
+                # No decision yet for this domain - add to undecided
+                entries_undecided+=("$id$DELIM$app_name$DELIM$description$DELIM$url$DELIM$start_time$DELIM$end_time")
+            fi
+        fi
+        # If decision == 0, keep the entry (do nothing)
+        
+    done < "$temp_file"
+    
+    rm -f "$temp_file"
+    
+    if [[ ${#entries_to_delete[@]} -eq 0 && ${#entries_undecided[@]} -eq 0 ]]; then
+        log_success "No non-work entries found to delete!"
+        return 0
+    fi
+    
+    # Display entries to delete
+    if [[ ${#entries_to_delete[@]} -gt 0 ]]; then
+        log_warn "Found ${#entries_to_delete[@]} non-work autotracker entries to auto-delete"
+        
+        # Only show details in verbose mode
+        if [[ "$VERBOSE" == "true" ]]; then
+    echo ""
+    for entry in "${entries_to_delete[@]}"; do
+                IFS=$DELIM read -r id app_name desc url start_time end_time <<< "$entry"
+        echo -e "${RED}DELETE${NC}: $id"
+                echo "  App: $app_name"
+        echo "  Description: ${desc:-\"(No Description)\"}"  
+                echo "  URL: ${url:-\"(No URL)\"}"
+                echo "  Time: $start_time → $end_time"
+                echo ""
+            done
+        else
+            # Just show a few examples
+            echo "  (Blacklisted apps/domains - use -v to see all)"
+        fi
+        echo ""
+    fi
+    
+    # Display undecided entries
+    if [[ ${#entries_undecided[@]} -gt 0 ]]; then
+        log_warn "Found ${#entries_undecided[@]} entries that need review"
+        
+        # Only show details in verbose mode
+        if [[ "$VERBOSE" == "true" ]]; then
+            echo ""
+            for entry in "${entries_undecided[@]}"; do
+                IFS=$DELIM read -r id app_name desc url start_time end_time <<< "$entry"
+                echo -e "${YELLOW}REVIEW${NC}: $id"
+                echo "  App: $app_name"
+                echo "  Description: ${desc:-\"(No Description)\"}"
+                echo "  URL: ${url:-\"(No URL)\"}"
+                echo "  Time: $start_time → $end_time"
+                echo ""
+            done
+        else
+            # Count unique domains for summary
+            declare -A domain_entry_count
+            for entry in "${entries_undecided[@]}"; do
+                IFS=$DELIM read -r id app_name desc url start_time end_time <<< "$entry"
+                local domain=$(extract_domain "$url")
+                if [[ -n "$domain" ]]; then
+                    domain_entry_count[$domain]=$((${domain_entry_count[$domain]:-0} + 1))
+                else
+                    domain_entry_count[$app_name]=$((${domain_entry_count[$app_name]:-0} + 1))
+                fi
+            done
+            echo "  Will be grouped by domain/app for review (use -v to see all)"
+        fi
+        echo ""
+    fi
+    
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "DRY RUN: No entries would be deleted"
+        return 0
+    fi
+    
+    # Combine all entries for processing
+    local all_entries_to_process=("${entries_to_delete[@]}" "${entries_undecided[@]}")
+    
+    # Handle batch mode vs individual confirmation
+    if [[ "$BATCH_MODE" == "true" ]]; then
+        # Batch mode: confirm all at once, then delete all
+        if [[ "$SKIP_CONFIRMATION" != "true" ]]; then
+            echo -n "Delete all ${#all_entries_to_process[@]} entries listed above? [y/N]: "
+            read -r response
+            if [[ ! "$response" =~ ^[Yy]$ ]]; then
+                log_info "Batch deletion cancelled"
+                return 0
+            fi
+        fi
+        
+        log_info "Deleting all entries from database..."
+        local deleted_count=0
+        local failed_count=0
+        
+        for entry in "${all_entries_to_process[@]}"; do
+            IFS=$DELIM read -r id app_name desc url start_time end_time <<< "$entry"
+            
+            # Delete from SQLite database
+            if sqlite3 "$db_path" "DELETE FROM ZCDAUTOTRACKERITEM WHERE ZID = '$id'" 2>/dev/null; then
+                log_success "✓ Deleted: $app_name - $desc"
+                deleted_count=$((deleted_count + 1))
+            else
+                log_error "✗ Failed to delete: $app_name - $desc"
+                failed_count=$((failed_count + 1))
+            fi
+        done
+        
+        log_success "Batch deletion complete: $deleted_count deleted, $failed_count failed"
+        return 0
+    fi
+    
+    # Individual mode: auto-delete blacklisted, prompt for undecided
+    local deleted_count=0
+    local skipped_count=0
+    local failed_count=0
+    local entry_num=1
+    local total_entries=${#entries_undecided[@]}
+    
+    # First auto-delete blacklisted entries (no prompts)
+    if [[ ${#entries_to_delete[@]} -gt 0 ]]; then
+        log_info "Auto-deleting ${#entries_to_delete[@]} blacklisted entries..."
+        
+        for entry in "${entries_to_delete[@]}"; do
+            IFS=$'\x1F' read -r id app_name desc url start_time end_time <<< "$entry"
+            
+            # Try to delete, capture any errors (avoid set -e issues)
+            local delete_output
+            local delete_status
+            set +e  # Temporarily disable exit on error
+            delete_output=$(sqlite3 "$db_path" "DELETE FROM ZCDAUTOTRACKERITEM WHERE ZID = '$id'" 2>&1)
+            delete_status=$?
+            set -e  # Re-enable exit on error
+            
+            if [[ $delete_status -eq 0 ]]; then
+                deleted_count=$((deleted_count + 1))
+                if [[ "$VERBOSE" == "true" ]]; then
+                    log_success "✓ Deleted: $app_name - ${desc:-\"(No Description)\"}"
+                fi
+            else
+                if [[ "$VERBOSE" == "true" ]]; then
+                    log_error "✗ Failed to delete: $app_name - ${desc:-\"(No Description)\"}"
+                    log_error "   Error: $delete_output"
+                fi
+                failed_count=$((failed_count + 1))
+                
+                # If database is locked, warn user
+                if [[ "$delete_output" =~ "locked" ]]; then
+                    log_error "Database is locked - please close Clockify Desktop app and try again"
+                    return 1
+                fi
+            fi
+        done
+        
+        if [[ $deleted_count -gt 0 ]]; then
+            log_success "Auto-deleted $deleted_count blacklisted entries"
+        fi
+        if [[ $failed_count -gt 0 ]]; then
+            log_error "Failed to delete $failed_count entries"
+        fi
+        echo ""
+    fi
+    
+    # Exit if no undecided entries
+    if [[ ${#entries_undecided[@]} -eq 0 ]]; then
+        echo -e "${GREEN}=== DELETION SUMMARY ===${NC}"
+        echo -e "${GREEN}✓ Deleted:${NC} $deleted_count entries (auto-deleted blacklisted)"
+        if [[ $failed_count -gt 0 ]]; then
+            echo -e "${RED}✗ Failed:${NC} $failed_count entries"
+        fi
+        return 0
+    fi
+    
+    # Now process undecided entries with prompts
+    log_info "Reviewing ${#entries_undecided[@]} entries that need your decision:"
+    echo ""
+    
+    # Then process undecided entries - group by domain for Chrome/browser entries
+    declare -A asked_domains  # Track which domains we've already asked about
+    declare -A asked_apps     # Track which apps we've already asked about (for non-browser apps)
+    
+    for entry in "${entries_undecided[@]}"; do
+        IFS=$DELIM read -r id app_name desc url start_time end_time <<< "$entry"
+        local domain=$(extract_domain "$url")
+        
+        # If this entry has a domain and we haven't asked about it yet
+        if [[ -n "$domain" ]] && [[ -z "${asked_domains[$domain]+isset}" ]]; then
+            # Count how many entries share this domain
+            local domain_count=0
+            for check_entry in "${entries_undecided[@]}"; do
+                IFS=$DELIM read -r check_id check_app check_desc check_url check_start check_end <<< "$check_entry"
+                local check_domain=$(extract_domain "$check_url")
+                if [[ "$check_domain" == "$domain" ]]; then
+                    domain_count=$((domain_count + 1))
+                fi
+            done
+            
+            echo -e "${BLUE}[$entry_num/$total_entries]${NC} ${YELLOW}Domain Review${NC} - $domain_count entries:"
+            echo -e "  ${YELLOW}Domain:${NC} $domain"
+            echo -e "  ${YELLOW}App:${NC} $app_name"
+            echo -e "  ${YELLOW}Example URL:${NC} ${url:-\"(No URL)\"}"
+            echo -e "  ${YELLOW}Count:${NC} $domain_count entries from this domain"
+            echo ""
+            
+            if [[ "$SKIP_CONFIRMATION" == "true" ]]; then
+                response="n"  # Default to keeping unknown domains in auto mode
+            else
+                echo -n "Delete ALL entries from $domain? [y/N/q(uit)/s(how all)]: "
+                read -r response
+            fi
+            
+            # Mark this domain as asked
+            asked_domains[$domain]=1
+            
+            case "$response" in
+                [Ss]|[Ss][Hh][Oo][Ww])
+                    # Show all entries from this domain
+                    echo -e "\n${YELLOW}All entries from $domain:${NC}"
+                    for show_entry in "${entries_undecided[@]}"; do
+                        IFS=$DELIM read -r show_id show_app show_desc show_url show_start show_end <<< "$show_entry"
+                        local show_domain=$(extract_domain "$show_url")
+                        if [[ "$show_domain" == "$domain" ]]; then
+                            echo "  - $show_desc ($show_start → $show_end)"
+                        fi
+                    done
+                    echo ""
+                    echo -n "Delete ALL entries from $domain? [y/N/q(uit)]: "
+                    read -r response
+                    
+                    # Process the new response
+                    if [[ "$response" =~ ^[Yy]([Ee][Ss])?$ ]]; then
+                        # Delete all entries from this domain
+                        domain_decisions[$domain]=1
+                        for del_entry in "${entries_undecided[@]}"; do
+                            IFS=$DELIM read -r del_id del_app del_desc del_url del_start del_end <<< "$del_entry"
+                            local del_domain=$(extract_domain "$del_url")
+                            if [[ "$del_domain" == "$domain" ]]; then
+                                if sqlite3 "$db_path" "DELETE FROM ZCDAUTOTRACKERITEM WHERE ZID = '$del_id'" 2>/dev/null; then
+                                    deleted_count=$((deleted_count + 1))
+                                else
+                                    failed_count=$((failed_count + 1))
+                                fi
+                            fi
+                        done
+                        log_success "✓ Deleted $domain_count entries from $domain"
+                        entry_num=$((entry_num + domain_count))
+                    elif [[ "$response" =~ ^[Qq]([Uu][Ii][Tt])?$ ]]; then
+                        log_info "Deletion process cancelled by user"
+                        break
+                    else
+                        # Skip all entries from this domain
+                        domain_decisions[$domain]=0
+                        log_info "○ Skipped $domain_count entries from $domain"
+                        skipped_count=$((skipped_count + domain_count))
+                        entry_num=$((entry_num + domain_count))
+                    fi
+                    ;;
+                [Yy]|[Yy][Ee][Ss])
+                    # Delete all entries from this domain
+                    domain_decisions[$domain]=1
+                    for del_entry in "${entries_undecided[@]}"; do
+                        IFS=$DELIM read -r del_id del_app del_desc del_url del_start del_end <<< "$del_entry"
+                        local del_domain=$(extract_domain "$del_url")
+                        if [[ "$del_domain" == "$domain" ]]; then
+                            if sqlite3 "$db_path" "DELETE FROM ZCDAUTOTRACKERITEM WHERE ZID = '$del_id'" 2>/dev/null; then
+                                deleted_count=$((deleted_count + 1))
+                            else
+                                failed_count=$((failed_count + 1))
+                            fi
+                        fi
+                    done
+                    log_success "✓ Deleted $domain_count entries from $domain"
+                    entry_num=$((entry_num + domain_count))
+                    ;;
+                [Qq]|[Qq][Uu][Ii][Tt])
+                    log_info "Deletion process cancelled by user"
+                    break
+                    ;;
+                *)
+                    # Skip all entries from this domain
+                    domain_decisions[$domain]=0
+                    log_info "○ Skipped $domain_count entries from $domain"
+                    skipped_count=$((skipped_count + domain_count))
+                    entry_num=$((entry_num + domain_count))
+                    ;;
+            esac
+            
+            echo ""
+        elif [[ -z "$domain" ]] && [[ -z "${asked_apps[$app_name]+isset}" ]]; then
+            # No domain - group by app (e.g., non-browser apps like Warp)
+            # Count how many entries share this app
+            local app_count=0
+            for check_entry in "${entries_undecided[@]}"; do
+                IFS=$DELIM read -r check_id check_app check_desc check_url check_start check_end <<< "$check_entry"
+                local check_domain=$(extract_domain "$check_url")
+                if [[ -z "$check_domain" ]] && [[ "$check_app" == "$app_name" ]]; then
+                    app_count=$((app_count + 1))
+                fi
+            done
+            
+            echo -e "${BLUE}[$entry_num/$total_entries]${NC} ${YELLOW}App Review${NC} - $app_count entries:"
+            echo -e "  ${YELLOW}App:${NC} $app_name"
+            echo -e "  ${YELLOW}Example:${NC} ${desc:-\"(No Description)\"}"
+            echo -e "  ${YELLOW}Count:${NC} $app_count entries from this app"
+            echo ""
+            
+            if [[ "$SKIP_CONFIRMATION" == "true" ]]; then
+                response="n"  # Default to keeping unknown apps in auto mode
+            else
+                echo -n "Delete ALL entries from $app_name? [y/N/q(uit)/s(how all)]: "
+                read -r response
+            fi
+            
+            # Mark this app as asked
+            asked_apps[$app_name]=1
+            
+            case "$response" in
+                [Ss]|[Ss][Hh][Oo][Ww])
+                    # Show all entries from this app
+                    echo -e "\n${YELLOW}All entries from $app_name:${NC}"
+                    for show_entry in "${entries_undecided[@]}"; do
+                        IFS=$DELIM read -r show_id show_app show_desc show_url show_start show_end <<< "$show_entry"
+                        local show_domain=$(extract_domain "$show_url")
+                        if [[ -z "$show_domain" ]] && [[ "$show_app" == "$app_name" ]]; then
+                            echo "  - $show_desc ($show_start → $show_end)"
+                        fi
+                    done
+                    echo ""
+                    echo -n "Delete ALL entries from $app_name? [y/N/q(uit)]: "
+                    read -r response
+                    
+                    # Process the new response
+                    if [[ "$response" =~ ^[Yy]([Ee][Ss])?$ ]]; then
+                        # Delete all entries from this app
+                        for del_entry in "${entries_undecided[@]}"; do
+                            IFS=$DELIM read -r del_id del_app del_desc del_url del_start del_end <<< "$del_entry"
+                            local del_domain=$(extract_domain "$del_url")
+                            if [[ -z "$del_domain" ]] && [[ "$del_app" == "$app_name" ]]; then
+                                if sqlite3 "$db_path" "DELETE FROM ZCDAUTOTRACKERITEM WHERE ZID = '$del_id'" 2>/dev/null; then
+                                    deleted_count=$((deleted_count + 1))
+                                else
+                                    failed_count=$((failed_count + 1))
+                                fi
+                            fi
+                        done
+                        log_success "✓ Deleted $app_count entries from $app_name"
+                        entry_num=$((entry_num + app_count))
+                    elif [[ "$response" =~ ^[Qq]([Uu][Ii][Tt])?$ ]]; then
+                        log_info "Deletion process cancelled by user"
+                        break
+                    else
+                        # Skip all entries from this app
+                        log_info "○ Skipped $app_count entries from $app_name"
+                        skipped_count=$((skipped_count + app_count))
+                        entry_num=$((entry_num + app_count))
+                    fi
+                    ;;
+                [Yy]|[Yy][Ee][Ss])
+                    # Delete all entries from this app
+                    for del_entry in "${entries_undecided[@]}"; do
+                        IFS=$DELIM read -r del_id del_app del_desc del_url del_start del_end <<< "$del_entry"
+                        local del_domain=$(extract_domain "$del_url")
+                        if [[ -z "$del_domain" ]] && [[ "$del_app" == "$app_name" ]]; then
+                            if sqlite3 "$db_path" "DELETE FROM ZCDAUTOTRACKERITEM WHERE ZID = '$del_id'" 2>/dev/null; then
+                                deleted_count=$((deleted_count + 1))
+                            else
+                                failed_count=$((failed_count + 1))
+                            fi
+                        fi
+                    done
+                    log_success "✓ Deleted $app_count entries from $app_name"
+                    entry_num=$((entry_num + app_count))
+                    ;;
+                [Qq]|[Qq][Uu][Ii][Tt])
+                    log_info "Deletion process cancelled by user"
+                    break
+                    ;;
+                *)
+                    # Skip all entries from this app
+                    log_info "○ Skipped $app_count entries from $app_name"
+                    skipped_count=$((skipped_count + app_count))
+                    entry_num=$((entry_num + app_count))
+                    ;;
+            esac
+            
+            echo ""
+        fi
+        # If domain or app already processed, skip (already counted above)
+    done
+    
+    # Summary
+    echo -e "${GREEN}=== DELETION SUMMARY ===${NC}"
+    echo -e "${GREEN}✓ Deleted:${NC} $deleted_count entries"
+    echo -e "${BLUE}○ Skipped:${NC} $skipped_count entries"
+    if [[ $failed_count -gt 0 ]]; then
+        echo -e "${RED}✗ Failed:${NC} $failed_count entries"
+    fi
+    echo "Total processed: $((deleted_count + skipped_count + failed_count)) entries"
+}
+
+# Main function
+main() {
+    echo "🧹 Clockify Clean - Autotracker Entry Cleanup Tool"
+    echo ""
+    
+    parse_args "$@"
+    check_dependencies
+    
+    # Show configuration
+    log_info "Configuration:"
+    echo "  Days back: $DAYS_BACK"
+    echo "  Whitelist apps: ${WHITELIST_APPS[*]}"
+    echo "  Blacklist apps: loginwindow, Spotify, Netflix, Mail, Clockify Desktop"
+    echo "  Whitelist domains: ${WHITELIST_DOMAINS[*]}"
+    echo "  Blacklist domains: x.com, linkedin.com, coinmarketcap.com, tradingview.com,"
+    echo "                     bybitglobal.com, bybit.com, youtube.com, mantle.xyz, reuters.com"
+        echo ""
+    
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "DRY RUN MODE: No entries will be actually deleted"
+        echo ""
+    fi
+    
+    get_entries_to_delete
+}
+
+# Run main function with all arguments
+main "$@"
