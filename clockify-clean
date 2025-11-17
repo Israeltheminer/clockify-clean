@@ -1,7 +1,6 @@
-#!/usr/bin/env zsh
+#!/usr/bin/env bash
 
-# clockify-clean-optimized: Much faster version using grep for filtering
-# Original: 5-6 minutes | Optimized: ~10-20 seconds
+# clockify-clean: Autotracker cleanup tool
 
 set -euo pipefail
 
@@ -14,7 +13,7 @@ VERBOSE=false
 
 # App/Domain lists
 WHITELIST_APPS=("Cursor" "Figma" "Microsoft Teams" "Teams" "OrbStack" "Microsoft Outlook")
-BLACKLIST_APPS=("loginwindow" "Spotify" "Netflix" "Mail" "Weather" "Clockify Desktop" "Finder" "Automator" "UserNotificationCenter" "Messages" "YouTube Music" "iPhone Mirroring" "YouTube" "FL Studio" "Photo Booth" "Music" "SecurityAgent" "System Settings")
+BLACKLIST_APPS=("loginwindow" "Spotify" "Netflix" "Mail" "Weather" "Clockify Desktop" "Finder" "Automator" "UserNotificationCenter" "Messages" "YouTube Music" "iPhone Mirroring" "YouTube" "FL Studio" "Photo Booth" "Music" "SecurityAgent" "System Settings" "Brave Browser" "AutoFillPanelService" "Notes" "Preview" "Proton VPN" "Tor Browser" "Xcode" "Activity Monitor")
 WHITELIST_DOMAINS=("github.com" "localhost")
 BLACKLIST_DOMAINS=("x.com" "linkedin.com" "coinmarketcap.com" "tradingview.com" "bybitglobal.com" "bybit.com" "music.youtube.com" "youtube.com" "mantle.xyz" "reuters.com" "upwork.com" "mail.google.com" "reddit.com" "google.com/search")
 
@@ -31,7 +30,7 @@ log_error() { echo -e "${RED}[ERROR]${NC} $1" >&2; }
 log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1" >&2; }
 
 usage() {
-    echo "clockify-clean-optimized: Fast autotracker cleanup (uses grep)"
+    echo "clockify-clean: Autotracker cleanup"
     echo ""
     echo "Usage: $(basename $0) [options]"
     echo ""
@@ -94,7 +93,7 @@ process_entries() {
     fi
 
     # Fetch ALL entries at once
-    log_info "⚡ Fetching all entries from database..."
+    log_info "Fetching all entries from database..."
     local all_entries=$(mktemp)
 
     sqlite3 "$db_path" "
@@ -112,8 +111,8 @@ process_entries() {
     local total=$(wc -l < "$all_entries" | tr -d ' ')
     log_success "Fetched $total entries"
 
-    # OPTIMIZATION: Use grep to filter entries super fast
-    log_info "⚡ Filtering with grep (fast!)..."
+    # Filter entries
+    log_info "Filtering entries..."
 
     local blacklist_ids=$(mktemp)
     local whitelist_ids=$(mktemp)
@@ -138,7 +137,7 @@ process_entries() {
     done
     whitelist_pattern="${whitelist_pattern:1}"
 
-    # Filter entries using grep (MUCH faster than shell loops!)
+    # Filter entries using grep
     grep -E "$blacklist_pattern" "$all_entries" | cut -d'|' -f1 > "$blacklist_ids" 2>/dev/null || true
     grep -E "$whitelist_pattern" "$all_entries" | cut -d'|' -f1 > "$whitelist_ids" 2>/dev/null || true
 
@@ -152,7 +151,7 @@ process_entries() {
     local undecided_count=$(wc -l < "$undecided_ids" | tr -d ' ')
 
     echo ""
-    log_info "📊 Results:"
+    log_info "Results:"
     echo "  ✓ Whitelist (keep): $whitelist_count"
     echo "  ✗ Blacklist (delete): $blacklist_count"
     echo "  ? Undecided (review): $undecided_count"
@@ -178,7 +177,11 @@ process_entries() {
     # Delete blacklisted entries
     if [[ "$SKIP_CONFIRMATION" != "true" && "$BATCH_MODE" != "true" ]]; then
         echo -n "Delete $blacklist_count blacklisted entries? [y/N]: "
-        read -r response
+        read -r -t 15 response || {
+            log_info "No response received, defaulting to 'no'"
+            rm -f "$all_entries" "$blacklist_ids" "$whitelist_ids" "$undecided_ids"
+            return 0
+        }
         [[ ! "$response" =~ ^[Yy]$ ]] && {
             log_info "Cancelled"
             rm -f "$all_entries" "$blacklist_ids" "$whitelist_ids" "$undecided_ids"
@@ -186,7 +189,7 @@ process_entries() {
         }
     fi
 
-    log_info "🗑️  Deleting $blacklist_count entries..."
+    log_info "Deleting $blacklist_count entries..."
 
     local deleted=0
     local failed=0
@@ -221,7 +224,7 @@ process_entries() {
 }
 
 main() {
-    echo "⚡ Clockify Clean - OPTIMIZED (grep-powered)"
+    echo "Clockify Clean"
     echo ""
 
     parse_args "$@"
@@ -232,7 +235,7 @@ main() {
     local duration=$((end_time - start_time))
 
     echo ""
-    log_success "✨ Completed in ${duration}s (vs 5-6 minutes with original!)"
+    log_success "Completed in ${duration}s"
 }
 
 main "$@"
